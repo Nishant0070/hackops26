@@ -9,6 +9,9 @@ const crypto = require('crypto');
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
 const { PDFParse } = require('pdf-parse');
+const { extractCitations } = require('./lib/citations');
+const { pipeline } = require('@xenova/transformers');
+const db = require('./lib/db');
 
 const app = express();
 
@@ -84,6 +87,81 @@ const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 const DOCS_FILE = path.join(DATA_DIR, 'documents.json');
 const DEMO_CACHE_FILE = path.join(DATA_DIR, 'demo_cache.json');
+const BNS_MAP_FILE = path.join(DATA_DIR, 'ipc_bns_map.json');
+
+let bnsMap = [];
+try {
+    if (fs.existsSync(BNS_MAP_FILE)) {
+        bnsMap = JSON.parse(fs.readFileSync(BNS_MAP_FILE, 'utf-8'));
+        console.log(`Loaded 230+ legal reference entries`);
+    }
+} catch (e) {
+    console.error("Failed to load BNS map:", e);
+}
+
+let embedder = null;
+async function getEmbedder() {
+    if (!embedder) {
+        embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+    }
+    return embedder;
+}
+
+async function getEmbedding(text) {
+    const extractor = await getEmbedder();
+    const output = await extractor(text, { pooling: 'mean', normalize: true });
+    return Array.from(output.data);
+}
+
+function cosineSim(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+    }
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+}
+
+// Extract candidate exact-match tokens from the question (Part 3)
+function extractQuestionTokens(q) {
+    const tokens = new Set();
+    // Case number patterns: "123/2024", "W.P. 456 of 2023"
+    (q.match(/\b\d{1,6}\s*[\/\-]\s*\d{2,4}\b/g) || []).forEach(t => tokens.add(t.replace(/\s+/g, '')));
+    // Section citations: "Section 302", "s. 420", "302"
+    (q.match(/\b(?:section|sec|s|u\/s)\s*\.?\s*\d{1,3}[A-Za-z]?\b/gi) || []).forEach(t => {
+        const n = t.match(/\d{1,3}[A-Za-z]?/);
+        if (n) tokens.add(n[0].toUpperCase());
+    });
+    // Standalone 3-digit numbers that look like sections
+    (q.match(/\b\d{2,3}[A-Za-z]?\b/g) || []).forEach(t => tokens.add(t.toUpperCase()));
+    return Array.from(tokens);
+}
+
+async function ensureDocumentChunks(doc) {
+    if (doc.chunks && doc.chunks.length > 0) return doc.chunks;
+    const paras = doc.paragraphs || (doc.structuredData?.raw_text ? doc.structuredData.raw_text.split(/\n\s*\n/).map((t, i) => ({ i, text: t.trim() })).filter(p => p.text.length > 10) : []);
+    const chunks = [];
+    for (let idx = 0; idx < paras.length; idx++) {
+        const p = paras[idx];
+        if (!p.text || p.text.length < 10) continue;
+        try {
+            const emb = await getEmbedding(p.text.substring(0, 1000));
+            chunks.push({
+                id: `${doc.id}_chunk_${idx}`,
+                text: p.text,
+                embedding: emb,
+                source_doc_id: doc.id,
+                source_filename: doc.fileName
+            });
+        } catch (e) {
+            console.warn(`Error generating chunk embedding for doc ${doc.id}:`, e.message);
+        }
+    }
+    doc.chunks = chunks;
+    return chunks;
+}
 
 let documents = [];
 try {
@@ -189,17 +267,25 @@ class GroqRateLimiter {
 const rateLimiter = new GroqRateLimiter();
 
 // Endpoints (supporting both /api/* and /* paths so env var mismatches don't break routing)
-app.get(['/api/documents', '/documents'], (req, res) => {
-    res.json(documents.filter(d => d.status === 'completed').map(d => {
-        const doc = { ...d };
-        delete doc.paragraphs;
-        return doc;
-    }));
+app.get(['/api/documents', '/documents'], async (req, res) => {
+    try {
+        const completedDocs = await db.getCompletedDocuments();
+        res.json(completedDocs.map(d => {
+            const doc = { ...d };
+            delete doc.paragraphs;
+            return doc;
+        }));
+    } catch (e) {
+        console.error("Failed to fetch documents:", e.message);
+        res.status(500).json({ error: "Failed to fetch documents" });
+    }
 });
 
 app.get(['/api/bns-map', '/bns-map'], (req, res) => {
     try {
-        const bnsMap = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'ipc_bns_map.json'), 'utf-8'));
+        if (!bnsMap || bnsMap.length === 0) {
+            bnsMap = JSON.parse(fs.readFileSync(BNS_MAP_FILE, 'utf-8'));
+        }
         res.json(bnsMap);
     } catch (e) {
         res.status(500).json({ error: "Failed to load BNS map" });
@@ -274,6 +360,48 @@ app.get(['/api/progress/:uploadId', '/progress/:uploadId'], (req, res) => {
     });
 });
 
+const CONCURRENCY = 3; // Tesseract workers are memory-hungry; three is a safe cap for local hardware
+async function ocrPagesParallel(processedImages, uploadId) {
+    const results = new Array(processedImages.length);
+    const uncertainSpans = [];
+    let completed = 0;
+    const workers = await Promise.all(
+        Array.from({ length: CONCURRENCY }, () => Tesseract.createWorker(['eng', 'hin']))
+    );
+    try {
+        const queue = processedImages.map((buf, idx) => ({ buf, idx }));
+        async function runWorker(worker) {
+            while (queue.length > 0) {
+                const task = queue.shift();
+                if (!task) return;
+                try {
+                    const { data } = await worker.recognize(task.buf);
+                    results[task.idx] = { index: task.idx, text: data.text };
+                    if (data.blocks) {
+                        data.blocks.forEach(b => (b.paragraphs || []).forEach(p =>
+                            (p.lines || []).forEach(l => (l.words || []).forEach(w => {
+                                if (w.confidence < 60 && w.text.length > 3) uncertainSpans.push(w.text);
+                            }))
+                        ));
+                    }
+                } catch (err) {
+                    console.error(`Page ${task.idx + 1} OCR failed:`, err);
+                    results[task.idx] = { index: task.idx, text: '\n[OCR FAILED FOR THIS PAGE]\n' };
+                }
+                completed++;
+                sendProgress(uploadId, 'ocr_extraction',
+                    35 + Math.round((completed / processedImages.length) * 25),
+                    `Reading page ${completed} of ${processedImages.length}...`);
+            }
+        }
+        await Promise.all(workers.map(runWorker));
+    } finally {
+        await Promise.all(workers.map(w => w.terminate().catch(() => {})));
+    }
+    results.sort((a, b) => a.index - b.index);
+    return { results, uncertainSpans };
+}
+
 // The Pipeline
 app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => {
     const uploadId = req.body.uploadId || req.headers['x-upload-id'] || Date.now().toString();
@@ -292,7 +420,7 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
         req.files.forEach(f => hash.update(f.buffer));
         const fileHash = hash.digest('hex');
 
-        const cachedDoc = documents.find(d => d.hash === fileHash && d.status === 'completed');
+        const cachedDoc = await db.findDocumentByHash(fileHash);
         if (cachedDoc) {
             console.log(`[Stage 0] Cache hit for ${fileHash}`);
             sendProgress(uploadId, 'completed', 100, 'Loaded from instant cache', { documentId: cachedDoc.id });
@@ -310,7 +438,7 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
             status: 'processing'
         };
         documents.push(newDoc);
-        saveDocuments();
+        await db.saveDocument(newDoc);
 
         let combinedRawText = '';
         let uncertainSpans = [];
@@ -393,41 +521,10 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
                 }
             }
 
-            // Stage 2: OCR (Tesseract local)
-            console.log(`[Stage 2] OCR starting...`);
-            let worker = null;
-            const pagesOcr = [];
-
-            try {
-                worker = await Tesseract.createWorker(['eng', 'hin']);
-                for (let i = 0; i < processedImages.length; i++) {
-                    console.log(`[Stage 2] OCR Page ${i+1}/${processedImages.length}`);
-                    sendProgress(uploadId, 'ocr_extraction', 35 + Math.round(((i + 1) / processedImages.length) * 25), `Reading page ${i+1} of ${processedImages.length}...`);
-                    try {
-                        const { data } = await worker.recognize(processedImages[i]);
-                        pagesOcr.push({ index: i, text: data.text });
-
-                        if (data.blocks) {
-                            data.blocks.forEach(b => {
-                                if (b.paragraphs) b.paragraphs.forEach(p => {
-                                    if (p.lines) p.lines.forEach(l => {
-                                        if (l.words) l.words.forEach(w => {
-                                            if (w.confidence < 60 && w.text.length > 3) uncertainSpans.push(w.text);
-                                        });
-                                    });
-                                });
-                            });
-                        }
-                    } catch (err) {
-                        console.error(`Page ${i+1} OCR failed:`, err);
-                        pagesOcr.push({ index: i, text: "\n[OCR FAILED FOR THIS PAGE]\n" });
-                    }
-                }
-            } finally {
-                if (worker) {
-                    await worker.terminate().catch(e => console.error("Worker termination error:", e));
-                }
-            }
+            // Stage 2: Parallel OCR (Tesseract local)
+            console.log(`[Stage 2] OCR starting (parallel worker pool)...`);
+            const { results: pagesOcr, uncertainSpans: newUncertain } = await ocrPagesParallel(processedImages, uploadId);
+            uncertainSpans.push(...newUncertain);
 
             // Stage 3: Assemble
             console.log(`[Stage 3] Assembling text...`);
@@ -529,18 +626,43 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
             return res.status(400).json({ error: 'Uploaded file does not appear to be a legal document.' });
         }
 
+        // Part 2: Extract citations deterministically with tightened extractor
+        const extractedCitations = extractCitations(combinedRawText, bnsMap);
+        structData.old_law_citations = extractedCitations;
+
         const finalStructuredData = {
             ...structData,
             ...explainData,
+            old_law_citations: extractedCitations,
             raw_text: combinedRawText,
             uncertain_spans: uncertainSpans
         };
+
+        // Stage 5: Compute chunks and local embeddings for hybrid retrieval (Part 3)
+        const chunks = [];
+        for (let idx = 0; idx < paragraphs.length; idx++) {
+            const p = paragraphs[idx];
+            if (!p.text || p.text.length < 10) continue;
+            try {
+                const emb = await getEmbedding(p.text.substring(0, 1000));
+                chunks.push({
+                    id: `${docId}_chunk_${idx}`,
+                    text: p.text,
+                    embedding: emb,
+                    source_doc_id: docId,
+                    source_filename: fileName
+                });
+            } catch (e) {
+                console.warn(`[Embeddings] Chunk ${idx} failed:`, e.message);
+            }
+        }
 
         // Stage 6: Persist
         newDoc.status = 'completed';
         newDoc.structuredData = finalStructuredData;
         newDoc.paragraphs = paragraphs;
-        saveDocuments();
+        newDoc.chunks = chunks;
+        await db.saveDocument(newDoc);
         
         // Cache as demo if it's the first successful one
         if (!fs.existsSync(DEMO_CACHE_FILE)) {
@@ -564,7 +686,7 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
 app.post(['/api/chat', '/chat'], async (req, res) => {
     try {
         const { documentId, question } = req.body;
-        const doc = documents.find(d => d.id === documentId);
+        const doc = await db.getDocumentById(documentId);
         if (!doc) return res.status(404).json({ error: 'Document not found' });
 
         // Helper to call Groq in plain text mode (works with thinking models)
@@ -602,15 +724,51 @@ Question: ${question}`
             return res.json({ answer: tier0Answer, supporting_quote: '', source: 'document', unverifiedFigure: false });
         }
 
-        // Tier 1: Keyword-match paragraphs
-        console.log(`[Chat] Trying Tier 1...`);
-        const keywords = question.toLowerCase().split(/\W+/).filter(w => w.length > 3);
-        const relevantParas = (doc.paragraphs || []).filter(p =>
-            keywords.some(k => p.text.toLowerCase().includes(k))
-        );
+        // Cross-document pool assembly (Part 6)
+        await ensureDocumentChunks(doc);
+        const currentCase = doc.structuredData?.case_number;
+        let searchPool = [];
 
-        if (relevantParas.length > 0) {
-            const contextText = relevantParas.map(p => p.text).join('\n\n').substring(0, 10000);
+        if (currentCase && currentCase !== 'N/A') {
+            searchPool = await db.getChunksForCase(currentCase);
+        }
+
+        if (!searchPool || searchPool.length === 0) {
+            searchPool = (doc.chunks || []).map(c => ({
+                ...c,
+                source_doc_id: doc.id,
+                source_filename: doc.fileName
+            }));
+        }
+
+        // Tier 1: Hybrid retrieval (Part 3 & Part 6)
+        console.log(`[Chat] Trying Tier 1 (Hybrid Retrieval)...`);
+        let scored = [];
+        try {
+            const questionEmbedding = await getEmbedding(question);
+            const qTokens = extractQuestionTokens(question);
+            scored = searchPool
+                .map(c => {
+                    const vectorScore = cosineSim(questionEmbedding, c.embedding);
+                    let keywordBoost = 0;
+                    if (qTokens.length > 0) {
+                        const chunkUpper = c.text.toUpperCase();
+                        for (const tok of qTokens) {
+                            if (chunkUpper.includes(tok)) keywordBoost += 0.15;
+                        }
+                    }
+                    return { ...c, score: vectorScore + Math.min(keywordBoost, 0.3) };
+                })
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 5);
+        } catch (embedErr) {
+            console.warn('[Chat] Embedding calculation failed, falling back to keyword filter:', embedErr.message);
+            const keywords = question.toLowerCase().split(/\W+/).filter(w => w.length > 3);
+            scored = searchPool.filter(c => keywords.some(k => c.text.toLowerCase().includes(k))).slice(0, 5);
+        }
+
+        if (scored.length > 0) {
+            const contextText = scored.map(c => c.text).join('\n\n').substring(0, 10000);
             const tier1Answer = await callGroqChat([{
                 role: 'user',
                 content: `You are a helpful legal assistant. Answer the user's question using ONLY the provided text snippets from a legal document. Detect the language of the question and answer in the SAME language (English, Hindi, or Marathi). After your answer, on a new line write QUOTE: followed by a short verbatim phrase from the text that supports your answer. If the text does not contain the answer, reply ONLY with: INSUFFICIENT_DATA
@@ -625,11 +783,15 @@ Question: ${question}`
                 // Extract the quote line if present
                 const quoteMatch = tier1Answer.match(/QUOTE:\s*(.+)/i);
                 const cleanAnswer = tier1Answer.replace(/QUOTE:.*/i, '').trim();
+                const topChunk = scored[0];
+                const isCrossDoc = Boolean(topChunk && topChunk.source_doc_id && topChunk.source_doc_id !== doc.id);
                 return res.json({
                     answer: cleanAnswer,
                     supporting_quote: quoteMatch ? quoteMatch[1].trim() : '',
                     source: 'document',
-                    unverifiedFigure: false
+                    unverifiedFigure: false,
+                    cross_document: isCrossDoc,
+                    source_filename: isCrossDoc ? topChunk.source_filename : undefined
                 });
             }
         }
@@ -704,7 +866,13 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5001;
-app.listen(PORT, '0.0.0.0', () => console.log(`Backend listening on 0.0.0.0:${PORT}`));
 
-
-
+// Initialize database schema and start listening
+(async () => {
+    try {
+        await db.initDB();
+    } catch (e) {
+        console.error('[Startup] DB initialization error:', e.message);
+    }
+    app.listen(PORT, '0.0.0.0', () => console.log(`Backend listening on 0.0.0.0:${PORT}`));
+})();
