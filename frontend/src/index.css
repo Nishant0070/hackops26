@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+@theme {
+  --color-clawde-ink: #1B2430;
+  --color-clawde-parchment: #F7F3EA;
+  --color-clawde-oxblood: #7A2E2E;
+  --color-clawde-brass: #A9822F;
+  --color-clawde-charcoal: #2E2E2E;
+  --color-clawde-offwhite: #FAFAF8;
+  --font-serif: "Lora", serif;
+  --font-sans: "Inter", sans-serif;
+  --font-devanagari: "IBM Plex Sans Devanagari", sans-serif;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--color-clawde-ink);
+  color: var(--color-clawde-charcoal);
+}
+
+:root {
+  --background: var(--color-clawde-offwhite);
+  --foreground: var(--color-clawde-charcoal);
+  --card: var(--color-clawde-parchment);
+  --card-foreground: var(--color-clawde-charcoal);
+  --popover: var(--color-clawde-parchment);
+  --popover-foreground: var(--color-clawde-charcoal);
+  --primary: var(--color-clawde-ink);
+  --primary-foreground: var(--color-clawde-offwhite);
+  --secondary: var(--color-clawde-parchment);
+  --secondary-foreground: var(--color-clawde-ink);
+  --muted: var(--color-clawde-parchment);
+  --muted-foreground: var(--color-clawde-charcoal);
+  --accent: var(--color-clawde-brass);
+  --accent-foreground: var(--color-clawde-offwhite);
+  --destructive: var(--color-clawde-oxblood);
+  --destructive-foreground: var(--color-clawde-offwhite);
+  --border: #E2D9CC;
+  --input: #E2D9CC;
+  --ring: var(--color-clawde-brass);
+  --radius: 0.5rem;
+}
+
