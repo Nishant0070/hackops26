@@ -1,7 +1,20 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { FileText, Loader2, Calendar, Volume2, Square, Share2, AlertTriangle } from 'lucide-react';
+import {
+  Scale,
+  MessageSquare,
+  X,
+  ChevronDown,
+  Volume2,
+  Square,
+  Share2,
+  AlertTriangle,
+  Calendar,
+  Loader2
+} from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Toaster, toast } from 'sonner';
 import { ChatPanel } from '@/components/ChatPanel';
 import { PipelineProgress } from '@/components/PipelineProgress';
 
@@ -15,31 +28,47 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [currentUploadId, setCurrentUploadId] = useState(null);
 
-  // Store page images for the Original tab
-  const [pageImages, setPageImages] = useState([]);
+  // Summary language segmented control ('en' | 'hi') persisted to localStorage
+  const [summaryLang, setSummaryLang] = useState(() => {
+    return localStorage.getItem('clawde_summary_lang') || 'en';
+  });
 
-  // Tabs
-  const [centerTab, setCenterTab] = useState('extracted'); // 'original' | 'extracted'
-  const [rightTab, setRightTab] = useState('summary'); // 'summary' | 'details' | 'timeline' | 'ask'
+  // Collapsible extracted text section
+  const [extractedOpen, setExtractedOpen] = useState(false);
 
+  // Slide-in chat panel state
+  const [chatOpen, setChatOpen] = useState(false);
+  const [hasOpenedChat, setHasOpenedChat] = useState(false);
+
+  // Speech synthesis
+  const [speakingId, setSpeakingId] = useState(null);
+  const hasTTS = typeof window !== 'undefined' && 'speechSynthesis' in window;
+
+  // Speech recognition (voice input)
   const [isListening, setIsListening] = useState(false);
   const [voiceLang, setVoiceLang] = useState('en-IN'); // en-IN | hi-IN | mr-IN
   const [voiceError, setVoiceError] = useState(null);
   const recognitionRef = useRef(null);
-
-  // TTS state — tracks which block is currently speaking (a unique id string)
-  const [speakingId, setSpeakingId] = useState(null);
-  const hasTTS = typeof window !== 'undefined' && 'speechSynthesis' in window;
+  const hasSpeechRecognition = typeof window !== 'undefined' &&
+    ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window);
 
   const [bnsMap, setBnsMap] = useState([]);
-  // Detect speech support — Safari uses webkit prefix, Chrome uses standard
-  const hasSpeechRecognition = typeof window !== 'undefined' && 
-    ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window);
 
   useEffect(() => {
     fetchDocuments();
     fetchBnsMap();
   }, []);
+
+  // Keyboard shortcut: close chat with Escape
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape' && chatOpen) {
+        setChatOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [chatOpen]);
 
   const fetchDocuments = async () => {
     try {
@@ -59,7 +88,6 @@ function App() {
     }
   };
 
-  // Create the SpeechRecognition instance once on mount
   const initSpeechRecognition = () => {
     if (!hasSpeechRecognition) return;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -70,7 +98,6 @@ function App() {
 
     recognition.onresult = (event) => {
       const transcript = event.results[0][0].transcript;
-      // When voice input arrives, dispatch it as a custom event or handled via state
       window.dispatchEvent(new CustomEvent('clawde:speech-result', { detail: transcript }));
       setVoiceError(null);
     };
@@ -138,37 +165,9 @@ function App() {
     const formData = new FormData();
     formData.append('fileName', file.name);
     formData.append('uploadId', uploadId);
-
-    let generatedImages = [];
+    formData.append('pages', file, file.name);
 
     try {
-      if (file.type === 'application/pdf') {
-        // Render previews in browser for Original View
-        const arrayBuffer = await file.arrayBuffer();
-        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
-        const scale = 1.5;
-
-        for (let i = 1; i <= Math.min(pdf.numPages, 10); i++) {
-          const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale });
-          const canvas = document.createElement('canvas');
-          const context = canvas.getContext('2d');
-          canvas.height = viewport.height;
-          canvas.width = viewport.width;
-
-          await page.render({ canvasContext: context, viewport }).promise;
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-          generatedImages.push(dataUrl);
-        }
-
-        // Send raw PDF directly so backend digital-text layer detection can run
-        formData.append('pages', file, file.name);
-      } else {
-        formData.append('pages', file);
-        const objUrl = URL.createObjectURL(file);
-        generatedImages.push(objUrl);
-      }
-
       const response = await axios.post(`${API_URL}/upload`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
@@ -177,9 +176,8 @@ function App() {
       });
 
       setSelectedDoc(response.data);
-      setPageImages(generatedImages);
-      setCenterTab('extracted');
-      setRightTab('summary');
+      setExtractedOpen(false);
+      setHasOpenedChat(false);
       fetchDocuments();
     } catch (error) {
       console.error('Upload failed', error);
@@ -192,9 +190,9 @@ function App() {
 
   const handleDocSelect = (doc) => {
     setSelectedDoc(doc);
-    setCenterTab('extracted');
-    setRightTab('summary');
-    setPageImages([]);
+    setExtractedOpen(false);
+    setHasOpenedChat(false);
+    stopSpeaking();
   };
 
   // TTS helpers
@@ -222,34 +220,28 @@ function App() {
     setSpeakingId(null);
   };
 
-  // WhatsApp share helper for the summary tab
+  const handleSetSummaryLang = (lang) => {
+    setSummaryLang(lang);
+    localStorage.setItem('clawde_summary_lang', lang);
+    stopSpeaking();
+  };
+
   const shareOnWhatsApp = (doc, lang = 'en') => {
     const bullets = lang === 'hi'
       ? (doc.structuredData?.summary_hi || []).join('\n• ')
       : (doc.structuredData?.summary_en || []).join('\n• ');
     const action = doc.structuredData?.action_required || '';
-    const msg = `*Case Summary — Clawde Justice Assistant*\n\n${action ? `⚠️ ${action}\n\n` : ''}• ${bullets}\n\n_This summary was generated by Clawde (clawde.app). Always verify details with a qualified advocate._`;
-    window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, '_blank', 'noopener');
-  };
-
-  const getBNSWarning = (citations) => {
-    if (!citations || citations.length === 0) return null;
-    const mapped = citations.map(c => bnsMap.find(m => m.old === c.citation || c.citation.includes(m.old))).filter(Boolean);
-    if (mapped.length === 0) return null;
-
-    return (
-      <div className="bg-clawde-oxblood/10 border-l-4 border-clawde-oxblood p-4 my-4 rounded shadow-sm">
-        <h4 className="text-clawde-oxblood font-bold flex items-center gap-2 mb-1 uppercase tracking-wider text-sm font-sans">
-          <AlertTriangle className="w-4 h-4" /> Law Update Notice
-        </h4>
-        <div className="text-sm text-clawde-ink mt-2 font-sans">
-          {mapped.map((m, i) => (
-            <p key={i} className="mb-1">This document cites <strong>{m.old}</strong> ({m.offence}). Since 1 July 2024, the corresponding provision is <strong>{m.new}</strong>.</p>
-          ))}
-          <p className="text-xs text-clawde-ink mt-2 border-t border-clawde-oxblood/20 pt-2 font-serif italic">Which law applies depends on the date of the offence, not the date of the document. Offences before 1 July 2024 are still tried under the IPC.</p>
-        </div>
-      </div>
-    );
+    const msg = `*Case Summary — Clawde Justice Assistant*\n\n${action ? `⚠️ ${action}\n\n` : ''}• ${bullets}\n\n_This summary was generated by Clawde. Always verify details with a qualified advocate._`;
+    try {
+      const opened = window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, '_blank', 'noopener');
+      if (!opened) {
+        navigator.clipboard.writeText(msg);
+        toast.success(lang === 'hi' ? 'सारांश क्लिपबोर्ड पर कॉपी किया गया!' : 'Summary copied to clipboard!');
+      }
+    } catch (e) {
+      navigator.clipboard.writeText(msg);
+      toast.success(lang === 'hi' ? 'सारांश क्लिपबोर्ड पर कॉपी किया गया!' : 'Summary copied to clipboard!');
+    }
   };
 
   const highlightUncertainSpans = (text, spans) => {
@@ -264,16 +256,47 @@ function App() {
     return highlightedText;
   };
 
+  // Extract parties helper
+  const parties = selectedDoc?.structuredData?.parties || [];
+  const filedBy = parties.filter(p => /petitioner|appellant|complainant|plaintiff/i.test(p.role)).map(p => p.name).join(', ') || parties[0]?.name || 'N/A';
+  const filedAgainst = parties.filter(p => /respondent|accused|defendant/i.test(p.role)).map(p => p.name).join(', ') || parties[1]?.name || 'N/A';
+  const keyDates = selectedDoc?.structuredData?.key_dates || [];
+  const nextHearingDate = keyDates.find(d => /next|hearing|listed|adjourn/i.test(d.event))?.date || 'None scheduled';
+
+  // Law update citations mapping
+  const docCitations = selectedDoc?.structuredData?.old_law_citations || [];
+  const mappedCitations = docCitations
+    .map(c => bnsMap.find(m => m.old === c.citation || c.citation === m.old || (m.old && c.citation && c.citation.includes(m.old))))
+    .filter(Boolean);
+  const uniqueMapped = Array.from(new Map(mappedCitations.map(m => [m.old, m])).values());
+
+  const unmappedCitations = docCitations.filter(c =>
+    !bnsMap.some(m => m.old === c.citation || (m.old && c.citation && c.citation.includes(m.old)))
+  );
+  const uniqueUnmapped = Array.from(new Map(unmappedCitations.map(u => [u.citation, u])).values());
+
+  const bullets = summaryLang === 'hi'
+    ? (selectedDoc?.structuredData?.summary_hi || [])
+    : (selectedDoc?.structuredData?.summary_en || []);
+
+  const shouldPulseFab = Boolean(
+    selectedDoc?.structuredData?.suggested_questions?.length > 0 && !hasOpenedChat
+  );
+
   return (
     <div className="min-h-screen font-sans flex flex-col md:flex-row bg-clawde-ink text-clawde-charcoal overflow-hidden">
-      
+      <Toaster position="bottom-center" />
+
       {/* 1. LEFT PANEL (Case Browser) */}
       <div className="w-full md:w-3/12 lg:w-[22%] bg-clawde-ink border-r border-white/10 flex flex-col h-screen overflow-y-auto shrink-0 z-20">
         <div className="p-6 text-clawde-parchment">
-          <h1 className="text-3xl font-bold font-serif flex items-center gap-2 tracking-tight">
-            <FileText className="w-7 h-7 text-clawde-brass" /> Clawde
-          </h1>
-          <p className="text-xs text-clawde-parchment/60 mt-1 uppercase tracking-[0.2em] font-semibold">Justice Assistant</p>
+          <div className="brand-mark flex items-center gap-3">
+            <Scale className="w-7 h-7 text-clawde-brass" strokeWidth={1.5} />
+            <div>
+              <h1 className="text-xl font-serif font-semibold text-clawde-parchment tracking-tight">Clawde</h1>
+              <p className="text-[10px] font-sans text-clawde-parchment/50 uppercase tracking-[0.15em]">Justice Assistant</p>
+            </div>
+          </div>
         </div>
 
         <div className="p-5">
@@ -287,7 +310,7 @@ function App() {
             />
             <button 
               type="button"
-              className={`w-full py-3 px-4 text-sm font-semibold transition-colors border ${uploading ? 'bg-clawde-ink border-white/20 text-white/50 cursor-wait' : 'bg-clawde-parchment text-clawde-ink border-clawde-parchment hover:bg-white'}`}
+              className={`w-full py-3 px-4 text-[12px] font-sans font-semibold uppercase tracking-[0.1em] transition-colors border ${uploading ? 'bg-clawde-ink border-white/20 text-white/50 cursor-wait' : 'bg-clawde-parchment text-clawde-ink border-clawde-parchment hover:bg-white'}`}
             >
               {uploading ? 'Processing Document...' : 'Upload New Document'}
             </button>
@@ -295,7 +318,7 @@ function App() {
         </div>
 
         <div className="flex-1 p-5 flex flex-col gap-3">
-          <h3 className="text-[10px] font-bold text-clawde-parchment/50 uppercase tracking-widest mb-2 font-sans">Case Files</h3>
+          <h3 className="text-[10px] font-sans font-bold text-clawde-parchment/50 uppercase tracking-[0.18em] mb-2">Case Files</h3>
           {documents.length === 0 ? (
             <p className="text-sm text-clawde-parchment/60 font-serif italic">No documents uploaded. Add a scan to get started.</p>
           ) : (
@@ -330,243 +353,359 @@ function App() {
           />
         </div>
       ) : !selectedDoc ? (
-        <div className="flex-1 h-screen flex flex-col items-center justify-center bg-clawde-parchment text-clawde-ink/30 p-8 text-center">
-          <FileText className="w-16 h-16 mb-4 opacity-50" />
-          <p className="text-2xl font-serif">No document selected yet.</p>
-          <p className="text-sm font-sans mt-2">Upload a scan or PDF to get started.</p>
+        /* Empty State (5.4) */
+        <div className="flex-1 h-screen flex flex-col items-center justify-center bg-clawde-parchment p-8 text-center">
+          <Scale className="w-24 h-24 text-clawde-brass animate-scale-idle mb-6" strokeWidth={1.2} />
+          <h2 className="text-2xl font-serif text-clawde-ink mb-2">Upload a court document</h2>
+          <p className="text-[13px] font-sans text-clawde-ink/60 max-w-[36ch] leading-relaxed">
+            Clawde reads it, explains what it means in plain English or Hindi, and answers your questions about it.
+          </p>
         </div>
       ) : (
-        <div className="flex-1 flex h-screen overflow-hidden">
+        /* Single Scroll Restructured Layout (5.2) */
+        <div className="flex-1 h-screen overflow-y-auto bg-clawde-parchment relative scroll-smooth">
           
-          {/* 2. CENTER PANEL (Document Source) */}
-          <div className="w-[55%] bg-clawde-parchment flex flex-col h-full border-r border-clawde-ink/10">
-            {/* Tab Strip Center */}
-            <div className="flex bg-clawde-offwhite border-b border-clawde-ink/10 pt-2 px-4 gap-1">
-              <button 
-                type="button"
-                onClick={() => setCenterTab('original')}
-                className={`px-6 py-3 text-sm font-semibold uppercase tracking-wider font-sans rounded-t ${centerTab === 'original' ? 'bg-clawde-parchment text-clawde-ink border-t-2 border-clawde-oxblood' : 'text-clawde-ink/60 hover:bg-clawde-parchment/50'}`}
-              >
-                Original
-              </button>
-              <button 
-                type="button"
-                onClick={() => setCenterTab('extracted')}
-                className={`px-6 py-3 text-sm font-semibold uppercase tracking-wider font-sans rounded-t ${centerTab === 'extracted' ? 'bg-clawde-parchment text-clawde-ink border-t-2 border-clawde-oxblood' : 'text-clawde-ink/60 hover:bg-clawde-parchment/50'}`}
-              >
-                Extracted Text
-              </button>
-            </div>
-            
-            {/* Center Content */}
-            <div className="flex-1 overflow-y-auto p-8 relative">
-              {centerTab === 'original' && (
-                <div className="flex flex-col gap-4 items-center">
-                  {pageImages.length > 0 ? (
-                    pageImages.map((imgUrl, idx) => (
-                      <img key={idx} src={imgUrl} alt={`Page ${idx + 1}`} className="w-full max-w-2xl border border-clawde-ink/20 shadow-md" />
-                    ))
-                  ) : (
-                    <p className="text-sm font-serif italic text-clawde-ink/50 text-center mt-20">Original scan view is preserved for newly uploaded documents in this session.</p>
-                  )}
-                </div>
-              )}
+          {/* Section 1 — Hero card */}
+          <div className="bg-clawde-ink text-clawde-parchment pt-10 pb-8 px-10">
+            {selectedDoc.structuredData?.action_required ? (
+              <div className="bg-clawde-oxblood text-white p-5 mb-6 border-l-4 border-clawde-brass shadow-sm">
+                <p className="text-[10px] font-sans font-bold uppercase tracking-[0.18em] text-white/70 mb-1">
+                  Urgent Action Required
+                </p>
+                <h2 className="text-lg font-serif font-bold leading-snug">
+                  {selectedDoc.structuredData.action_required}
+                </h2>
+              </div>
+            ) : (
+              <p className="text-clawde-parchment/50 text-[13px] font-sans mb-4 tracking-wide">
+                Summary of your document
+              </p>
+            )}
 
-              {centerTab === 'extracted' && (
-                <div className="max-w-[75ch] mx-auto w-full">
-                  {selectedDoc.structuredData?.uncertain_spans?.length > 0 && (
-                    <div className="mb-6 flex items-center gap-2 text-[11px] uppercase tracking-wider font-semibold text-clawde-brass bg-clawde-brass/10 px-3 py-2 border-l-2 border-clawde-brass w-max">
-                      <AlertTriangle className="w-3 h-3" /> OCR Uncertainties Highlighted
-                    </div>
-                  )}
-                  <div 
-                    className="font-serif text-[15px] leading-[1.8] text-clawde-charcoal whitespace-pre-wrap text-justify"
-                    dangerouslySetInnerHTML={{ __html: highlightUncertainSpans(selectedDoc.structuredData?.raw_text, selectedDoc.structuredData?.uncertain_spans) }}
-                  />
-                </div>
-              )}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 pt-2 border-t border-white/10">
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-parchment/50 mb-1">
+                  Court
+                </p>
+                <p className="text-[15px] font-serif text-clawde-parchment truncate">
+                  {selectedDoc.structuredData?.court_name || "Unknown Court"}
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-parchment/50 mb-1">
+                  Case Number
+                </p>
+                <p className="text-[15px] font-serif text-clawde-parchment truncate">
+                  {selectedDoc.structuredData?.case_number || "N/A"}
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-parchment/50 mb-1">
+                  Document Type
+                </p>
+                <p className="text-[15px] font-serif text-clawde-parchment truncate">
+                  {selectedDoc.structuredData?.doc_type || "Legal Document"}
+                </p>
+              </div>
             </div>
           </div>
 
-          {/* 3. RIGHT PANEL (Analytical Lens) */}
-          <div className="flex-1 bg-clawde-offwhite flex flex-col h-full">
-            {/* Tab Strip Right */}
-            <div className="flex bg-clawde-offwhite border-b border-clawde-ink/10 pt-2 px-2 overflow-x-auto no-scrollbar">
-              {['summary', 'details', 'timeline', 'ask'].map(tab => (
-                <button 
-                  key={tab}
+          {/* Section 2 — Summary */}
+          <div className="py-12 px-10 bg-clawde-parchment">
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-[10px] font-sans font-bold uppercase tracking-[0.18em] text-clawde-ink/60">
+                In Plain Language
+              </span>
+              {hasTTS && bullets.length > 0 && (
+                <button
                   type="button"
-                  onClick={() => setRightTab(tab)}
-                  className={`px-5 py-3 text-sm font-semibold uppercase tracking-wider font-sans rounded-t whitespace-nowrap ${rightTab === tab ? 'bg-clawde-offwhite text-clawde-ink border-b-2 border-clawde-oxblood relative top-[1px]' : 'text-clawde-ink/50 hover:text-clawde-ink border-b-2 border-transparent'}`}
+                  onClick={() => speak(bullets.join(summaryLang === 'hi' ? '। ' : '. '), summaryLang === 'hi' ? 'hi-IN' : 'en-IN', 'summary')}
+                  className="flex items-center gap-1.5 text-clawde-ink/50 hover:text-clawde-oxblood transition-colors text-[12px] font-sans font-semibold uppercase tracking-[0.1em]"
+                  title={speakingId === 'summary' ? 'Stop listening' : 'Read aloud'}
                 >
-                  {tab === 'ask' ? 'Ask (Chat)' : tab}
+                  {speakingId === 'summary' ? <Square className="w-3.5 h-3.5 text-clawde-oxblood" /> : <Volume2 className="w-3.5 h-3.5" />}
+                  <span>{speakingId === 'summary' ? 'Stop' : 'Listen'}</span>
                 </button>
-              ))}
+              )}
             </div>
 
-            {/* Right Content */}
-            <div className="flex-1 overflow-y-auto p-6 lg:p-8">
-              
-              {/* SUMMARY TAB */}
-              {rightTab === 'summary' && (
-                <div className="flex flex-col gap-8 h-full">
-                  {selectedDoc.structuredData?.action_required && (
-                    <div className="bg-clawde-oxblood text-white p-5 shadow-sm border-l-4 border-clawde-ink">
-                      <h3 className="text-xs font-bold uppercase tracking-widest opacity-80 mb-1 font-sans">Action Required</h3>
-                      <h2 className="text-lg font-bold font-serif leading-snug">
-                        {selectedDoc.structuredData.action_required}
-                      </h2>
-                    </div>
-                  )}
-                  
-                  <div className="flex flex-col gap-6">
-                    <div className="bg-white p-6 border border-clawde-ink/10 relative">
-                      <div className="absolute top-0 left-0 w-1 h-full bg-clawde-ink"></div>
-                      <div className="flex items-center justify-between mb-4">
-                        <h3 className="font-bold text-clawde-ink/60 uppercase tracking-widest text-[10px] font-sans">English Summary</h3>
-                        {hasTTS && (
-                          <button
-                            type="button"
-                            onClick={() => speak((selectedDoc.structuredData?.summary_en || []).join('. '), 'en-IN', 'summary_en')}
-                            className="p-1 text-clawde-ink/30 hover:text-clawde-ink transition-colors"
-                            title={speakingId === 'summary_en' ? 'Stop' : 'Listen'}
-                          >
-                            {speakingId === 'summary_en' ? <Square className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-                          </button>
-                        )}
-                      </div>
-                      <ul className="list-disc pl-5 space-y-3 font-serif text-clawde-charcoal text-[15px] leading-relaxed">
-                        {selectedDoc.structuredData?.summary_en?.map((bullet, i) => (
-                          <li key={i} className="pl-1">{bullet}</li>
-                        ))}
-                      </ul>
-                    </div>
-                    
-                    <div className="bg-white p-6 border border-clawde-ink/10 relative">
-                      <div className="absolute top-0 left-0 w-1 h-full bg-clawde-oxblood"></div>
-                      <div className="flex items-center justify-between mb-4">
-                        <h3 className="font-bold text-clawde-ink/60 uppercase tracking-widest text-[10px] font-sans font-devanagari">इसका क्या मतलब है</h3>
-                        {hasTTS && (
-                          <button
-                            type="button"
-                            onClick={() => speak((selectedDoc.structuredData?.summary_hi || []).join('। '), 'hi-IN', 'summary_hi')}
-                            className="p-1 text-clawde-ink/30 hover:text-clawde-oxblood transition-colors"
-                            title={speakingId === 'summary_hi' ? 'Stop' : 'Listen'}
-                          >
-                            {speakingId === 'summary_hi' ? <Square className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-                          </button>
-                        )}
-                      </div>
-                      <ul className="list-disc pl-5 space-y-3 font-devanagari text-clawde-charcoal text-[17px] leading-relaxed">
-                        {selectedDoc.structuredData?.summary_hi?.map((bullet, i) => (
-                          <li key={i} className="pl-1">{bullet}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
+            {/* Segmented Control */}
+            <div className="flex items-center gap-2 mb-6">
+              <button
+                type="button"
+                onClick={() => handleSetSummaryLang('en')}
+                className={`px-4 py-1.5 rounded-full text-[12px] font-sans font-semibold uppercase tracking-[0.1em] transition-all ${summaryLang === 'en' ? 'bg-clawde-ink text-clawde-parchment shadow-sm' : 'bg-clawde-ink/5 text-clawde-ink/70 hover:bg-clawde-ink/10'}`}
+              >
+                English
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSetSummaryLang('hi')}
+                className={`px-4 py-1.5 rounded-full text-[12px] font-sans font-semibold uppercase tracking-[0.1em] transition-all ${summaryLang === 'hi' ? 'bg-clawde-ink text-clawde-parchment shadow-sm' : 'bg-clawde-ink/5 text-clawde-ink/70 hover:bg-clawde-ink/10'}`}
+              >
+                हिंदी
+              </button>
+            </div>
 
-                  {getBNSWarning(selectedDoc.structuredData?.old_law_citations)}
+            {/* Bulleted List */}
+            {bullets.length === 0 ? (
+              <p className="text-sm font-serif italic text-clawde-ink/50">Summary not available.</p>
+            ) : (
+              <ul className={`list-disc pl-5 space-y-3 max-w-[75ch] ${summaryLang === 'hi' ? 'font-devanagari text-[17px] leading-[1.85]' : 'font-serif text-[15px] leading-[1.8]'} text-clawde-charcoal`}>
+                {bullets.map((bullet, i) => (
+                  <li key={i} className="pl-1">{bullet}</li>
+                ))}
+              </ul>
+            )}
 
-                  {/* WhatsApp Share */}
-                  <div className="flex gap-3 pt-2">
-                    <button
-                      type="button"
-                      onClick={() => shareOnWhatsApp(selectedDoc, 'en')}
-                      className="flex items-center gap-2 px-4 py-2 border border-clawde-ink/20 bg-white text-clawde-ink text-[12px] font-sans font-semibold uppercase tracking-wider hover:bg-[#25D366] hover:text-white hover:border-[#25D366] transition-colors"
-                      title="Share English summary on WhatsApp"
-                    >
-                      <Share2 className="w-3.5 h-3.5" /> Share in English
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => shareOnWhatsApp(selectedDoc, 'hi')}
-                      className="flex items-center gap-2 px-4 py-2 border border-clawde-ink/20 bg-white text-clawde-ink text-[12px] font-sans font-semibold uppercase tracking-wider hover:bg-[#25D366] hover:text-white hover:border-[#25D366] transition-colors"
-                      title="Share Hindi summary on WhatsApp"
-                    >
-                      <Share2 className="w-3.5 h-3.5" /> हिंदी में शेयर करें
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* DETAILS TAB */}
-              {rightTab === 'details' && (
-                <div className="flex flex-col gap-6">
-                  <h2 className="text-2xl font-serif font-bold text-clawde-ink border-b border-clawde-ink/10 pb-4">Case Details</h2>
-                  
-                  <div className="grid grid-cols-1 gap-6">
-                    <div>
-                      <p className="text-[10px] font-bold text-clawde-ink/50 uppercase tracking-widest font-sans mb-1">Court Name</p>
-                      <p className="text-base font-serif font-bold text-clawde-charcoal">{selectedDoc.structuredData?.court_name || "Unknown Court"}</p>
-                    </div>
-                    <div>
-                      <p className="text-[10px] font-bold text-clawde-ink/50 uppercase tracking-widest font-sans mb-1">Case Number</p>
-                      <p className="text-base font-serif text-clawde-charcoal">{selectedDoc.structuredData?.case_number || "N/A"}</p>
-                    </div>
-                    <div>
-                      <p className="text-[10px] font-bold text-clawde-ink/50 uppercase tracking-widest font-sans mb-1">Document Type</p>
-                      <p className="text-base font-serif text-clawde-charcoal">{selectedDoc.structuredData?.doc_type || "N/A"}</p>
-                    </div>
-                    
-                    {selectedDoc.structuredData?.parties && selectedDoc.structuredData.parties.length > 0 && (
-                      <div className="pt-4 border-t border-clawde-ink/10">
-                        <p className="text-[10px] font-bold text-clawde-ink/50 uppercase tracking-widest font-sans mb-3">Parties Involved</p>
-                        <div className="flex flex-col gap-3">
-                          {selectedDoc.structuredData.parties.map((p, i) => (
-                            <div key={i} className="flex flex-col bg-white p-3 border border-clawde-ink/10">
-                              <span className="font-bold font-serif text-clawde-charcoal">{p.name}</span>
-                              <span className="text-xs font-sans text-clawde-ink/60 uppercase tracking-wider">{p.role}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* TIMELINE TAB */}
-              {rightTab === 'timeline' && (
-                <div className="flex flex-col gap-6 h-full">
-                  <h2 className="text-2xl font-serif font-bold text-clawde-ink border-b border-clawde-ink/10 pb-4">Key Dates</h2>
-                  
-                  {!selectedDoc.structuredData?.key_dates || selectedDoc.structuredData.key_dates.length === 0 ? (
-                    <p className="text-sm font-serif italic text-clawde-ink/50">No key dates extracted from this document.</p>
-                  ) : (
-                    <div className="flex flex-col relative pl-4 border-l border-clawde-ink/20 ml-2 mt-4 space-y-8">
-                      {selectedDoc.structuredData.key_dates.map((kd, idx) => (
-                        <div key={idx} className="relative pl-6">
-                          <div className="absolute w-3 h-3 bg-clawde-oxblood rounded-full -left-[6.5px] top-1 border-2 border-clawde-offwhite"></div>
-                          <div className="text-sm font-bold text-clawde-ink font-sans tracking-tight mb-1 flex items-center gap-2">
-                            <Calendar className="w-4 h-4 text-clawde-ink/40" /> {kd.date}
-                          </div>
-                          <div className="text-base text-clawde-charcoal font-serif">{kd.event}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* ASK TAB (Replaced with modular ChatPanel) */}
-              {rightTab === 'ask' && (
-                <ChatPanel
-                  selectedDoc={selectedDoc}
-                  apiUrl={API_URL}
-                  hasSpeechRecognition={hasSpeechRecognition}
-                  voiceLang={voiceLang}
-                  onCycleLang={cycleLang}
-                  isListening={isListening}
-                  toggleListen={toggleListen}
-                  voiceError={voiceError}
-                  hasTTS={hasTTS}
-                  speakingId={speakingId}
-                  onSpeak={speak}
-                  onStopSpeaking={stopSpeaking}
-                />
-              )}
+            {/* WhatsApp Share Buttons */}
+            <div className="flex flex-wrap gap-3 pt-6 mt-4">
+              <button
+                type="button"
+                onClick={() => shareOnWhatsApp(selectedDoc, 'en')}
+                className="flex items-center gap-2 px-4 py-2 border border-clawde-ink/20 bg-white text-clawde-ink text-[12px] font-sans font-semibold uppercase tracking-[0.1em] hover:bg-[#25D366] hover:text-white hover:border-[#25D366] transition-colors shadow-sm"
+                title="Share English summary on WhatsApp"
+              >
+                <Share2 className="w-3.5 h-3.5" /> Share in English
+              </button>
+              <button
+                type="button"
+                onClick={() => shareOnWhatsApp(selectedDoc, 'hi')}
+                className="flex items-center gap-2 px-4 py-2 border border-clawde-ink/20 bg-white text-clawde-ink text-[12px] font-sans font-semibold uppercase tracking-[0.1em] hover:bg-[#25D366] hover:text-white hover:border-[#25D366] transition-colors shadow-sm font-devanagari"
+                title="Share Hindi summary on WhatsApp"
+              >
+                <Share2 className="w-3.5 h-3.5" /> हिंदी में शेयर करें
+              </button>
             </div>
           </div>
+
+          {/* Section 3 — Key facts */}
+          <div className="py-12 px-10 bg-clawde-offwhite">
+            <h3 className="text-[10px] font-sans font-bold uppercase tracking-[0.18em] text-clawde-ink/50 mb-8">
+              Key Facts
+            </h3>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-y-8 gap-x-12 max-w-4xl">
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-ink/50 mb-1.5">
+                  Court
+                </p>
+                <p className="text-[16px] font-serif text-clawde-charcoal">
+                  {selectedDoc.structuredData?.court_name || "Unknown Court"}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-ink/50 mb-1.5">
+                  Case Number
+                </p>
+                <p className="text-[16px] font-serif text-clawde-charcoal">
+                  {selectedDoc.structuredData?.case_number || "N/A"}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-ink/50 mb-1.5">
+                  Document Type
+                </p>
+                <p className="text-[16px] font-serif text-clawde-charcoal">
+                  {selectedDoc.structuredData?.doc_type || "N/A"}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-ink/50 mb-1.5">
+                  Next Hearing
+                </p>
+                <p className="text-[16px] font-serif text-clawde-charcoal">
+                  {nextHearingDate}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-ink/50 mb-1.5">
+                  Filed By
+                </p>
+                <p className="text-[16px] font-serif text-clawde-charcoal">
+                  {filedBy}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-[11px] font-sans font-semibold uppercase tracking-[0.15em] text-clawde-ink/50 mb-1.5">
+                  Filed Against
+                </p>
+                <p className="text-[16px] font-serif text-clawde-charcoal">
+                  {filedAgainst}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Section 4 — Law update notice */}
+          {(uniqueMapped.length > 0 || uniqueUnmapped.length > 0) && (
+            <div className="py-8 px-10 bg-clawde-parchment">
+              {uniqueMapped.length > 0 && (
+                <div className="bg-clawde-oxblood/10 border-l-4 border-clawde-oxblood p-5 rounded-sm">
+                  <h4 className="text-clawde-oxblood font-bold flex items-center gap-2 mb-2 text-[11px] font-sans uppercase tracking-[0.15em]">
+                    <AlertTriangle className="w-4 h-4 text-clawde-oxblood shrink-0" /> Law Update Notice
+                  </h4>
+                  <div className="text-sm text-clawde-ink mt-2 font-sans space-y-1.5">
+                    {uniqueMapped.map((m, i) => (
+                      <p key={i} className="text-sm">
+                        This document cites <strong>{m.old}</strong> ({m.offence}). Since 1 July 2024, the corresponding provision is <strong>{m.new}</strong>.
+                      </p>
+                    ))}
+                    <p className="text-xs text-clawde-ink/80 mt-3 border-t border-clawde-oxblood/20 pt-2 font-serif italic">
+                      Which law applies depends on the date of the offence, not the date of the document. Offences before 1 July 2024 are still tried under the IPC.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {uniqueUnmapped.length > 0 && (
+                <div className="mt-4 p-4 border border-clawde-ink/10 bg-white/60 rounded-sm">
+                  <p className="text-[10px] font-sans font-bold uppercase tracking-[0.18em] text-clawde-ink/50 mb-2">
+                    Not Checked Against 2024 Criminal Laws
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {uniqueUnmapped.map((u, i) => (
+                      <span key={i} className="text-xs font-sans px-2.5 py-1 bg-clawde-ink/5 text-clawde-charcoal border border-clawde-ink/10">
+                        {u.citation}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Section 5 — Timeline strip */}
+          <div className="py-12 px-10 bg-clawde-parchment">
+            <h3 className="text-[10px] font-sans font-bold uppercase tracking-[0.18em] text-clawde-ink/50 mb-6">
+              Dates That Matter
+            </h3>
+
+            {keyDates.length === 0 ? (
+              <p className="text-sm font-serif italic text-clawde-ink/50">No key dates extracted from this document.</p>
+            ) : (
+              <div className="flex gap-6 overflow-x-auto pb-4 no-scrollbar items-start">
+                {keyDates.map((kd, idx) => (
+                  <div key={idx} className="shrink-0 min-w-[220px] max-w-[280px] flex flex-col gap-1.5 relative">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="w-2.5 h-2.5 rounded-full bg-clawde-oxblood shrink-0" />
+                      <span className="h-[1px] bg-clawde-ink/20 flex-1" />
+                    </div>
+                    <span className="font-sans font-bold text-sm text-clawde-ink tracking-tight flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5 text-clawde-ink/40" /> {kd.date}
+                    </span>
+                    <span className="font-serif italic text-sm text-clawde-charcoal leading-relaxed">
+                      {kd.event}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Section 6 — Extracted text (collapsible) */}
+          <div className="py-8 px-10 bg-clawde-offwhite">
+            <button
+              type="button"
+              onClick={() => setExtractedOpen(prev => !prev)}
+              className="w-full flex items-center justify-between text-left group"
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-sans font-bold uppercase tracking-[0.18em] text-clawde-ink/50">
+                  Extracted Text
+                </span>
+                {selectedDoc.structuredData?.uncertain_spans?.length > 0 && (
+                  <span className="text-[10px] font-sans font-semibold uppercase tracking-wider text-clawde-brass bg-clawde-brass/10 px-2 py-0.5 border border-clawde-brass/30">
+                    {selectedDoc.structuredData.uncertain_spans.length} uncertain words
+                  </span>
+                )}
+              </div>
+              <ChevronDown className={`w-4 h-4 text-clawde-ink/50 transition-transform ${extractedOpen ? 'rotate-180' : ''}`} />
+            </button>
+
+            {extractedOpen && (
+              <div className="mt-6 font-serif text-[15px] leading-[1.8] text-clawde-charcoal whitespace-pre-wrap max-w-[75ch] text-justify">
+                <div dangerouslySetInnerHTML={{ __html: highlightUncertainSpans(selectedDoc.structuredData?.raw_text, selectedDoc.structuredData?.uncertain_spans) }} />
+              </div>
+            )}
+          </div>
+
+          {/* Section 7 — Bottom breathing space (96px) */}
+          <div className="h-24 bg-clawde-parchment w-full" />
+
+          {/* Floating Action Button (FAB) for Chat */}
+          <button
+            type="button"
+            onClick={() => {
+              setChatOpen(true);
+              setHasOpenedChat(true);
+            }}
+            className={`fixed bottom-8 right-8 z-30 w-14 h-14 rounded-full bg-clawde-ink text-clawde-parchment flex items-center justify-center shadow-xl hover:bg-clawde-ink/90 transition-all ${shouldPulseFab ? 'animate-fab-pulse' : ''}`}
+            title="Ask about this document"
+          >
+            <MessageSquare className="w-6 h-6 text-clawde-parchment" />
+          </button>
+
+          {/* Slide-In Chat Drawer (Framer Motion) */}
+          <AnimatePresence>
+            {chatOpen && (
+              <>
+                {/* Backdrop */}
+                <motion.div
+                  className="fixed inset-0 bg-clawde-ink/40 z-40"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  onClick={() => setChatOpen(false)}
+                />
+
+                {/* Right Drawer */}
+                <motion.div
+                  className="fixed right-0 top-0 bottom-0 w-full md:w-[60%] bg-clawde-offwhite border-l border-clawde-ink z-50 flex flex-col shadow-2xl"
+                  initial={{ x: '100%' }}
+                  animate={{ x: 0 }}
+                  exit={{ x: '100%' }}
+                  transition={{ duration: 0.25, ease: 'easeOut' }}
+                >
+                  <div className="flex items-center justify-between px-6 py-4 border-b border-clawde-ink/10 bg-clawde-offwhite shrink-0">
+                    <div className="flex items-center gap-2">
+                      <MessageSquare className="w-5 h-5 text-clawde-brass" />
+                      <h2 className="font-serif font-bold text-lg text-clawde-ink">Ask About This Document</h2>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setChatOpen(false)}
+                      className="p-1.5 rounded text-clawde-ink/50 hover:text-clawde-oxblood hover:bg-clawde-ink/5 transition-colors"
+                      title="Close panel (Escape)"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+                  <div className="flex-1 overflow-hidden">
+                    <ChatPanel
+                      selectedDoc={selectedDoc}
+                      apiUrl={API_URL}
+                      hasSpeechRecognition={hasSpeechRecognition}
+                      voiceLang={voiceLang}
+                      onCycleLang={cycleLang}
+                      isListening={isListening}
+                      toggleListen={toggleListen}
+                      voiceError={voiceError}
+                      hasTTS={hasTTS}
+                      speakingId={speakingId}
+                      onSpeak={speak}
+                      onStopSpeaking={stopSpeaking}
+                    />
+                  </div>
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
         </div>
       )}
     </div>

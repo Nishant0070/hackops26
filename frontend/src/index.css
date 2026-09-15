@@ -44,3 +44,30 @@ body {
   --radius: 0.5rem;
 }
 
+@keyframes scale-idle {
+  0%, 100% {
+    transform: rotate(-2deg);
+  }
+  50% {
+    transform: rotate(2deg);
+  }
+}
+
+.animate-scale-idle {
+  animation: scale-idle 4s ease-in-out infinite;
+}
+
+@keyframes pulse-subtle {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(169, 130, 47, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 12px rgba(169, 130, 47, 0);
+  }
+}
+
+.animate-fab-pulse {
+  animation: pulse-subtle 2.5s infinite;
+}
+
+

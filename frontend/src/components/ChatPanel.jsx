@@ -54,6 +54,8 @@ export function ChatPanel({
         content: response.data.answer || 'No answer available.',
         source: response.data.source || 'document',
         unverifiedFigure: Boolean(response.data.unverifiedFigure),
+        cross_document: Boolean(response.data.cross_document),
+        source_filename: response.data.source_filename || '',
         supporting_quote: response.data.supporting_quote || ''
       };
 

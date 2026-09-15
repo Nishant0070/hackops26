@@ -64,7 +64,15 @@ export function MessageList({
                 {/* Source Badge Pill */}
                 {msg.source && (
                   <div className="flex items-center gap-1.5">
-                    {msg.source === "general" ? (
+                    {msg.cross_document && msg.source_filename ? (
+                      <Badge
+                        variant="secondary"
+                        className="text-[11px] font-medium tracking-wide flex items-center gap-1 border border-[#E2D9CC] bg-[var(--color-clawde-brass)]/20 text-[var(--color-clawde-ink)]"
+                      >
+                        <FileText className="w-3 h-3 text-[var(--color-clawde-ink)]" />
+                        Answer drawn from another filing in this case: {msg.source_filename}
+                      </Badge>
+                    ) : msg.source === "general" ? (
                       <Badge
                         variant="brass"
                         className="text-[11px] font-medium tracking-wide flex items-center gap-1 shadow-sm"
