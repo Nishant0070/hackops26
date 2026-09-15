@@ -89,6 +89,8 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 const DOCS_FILE = path.join(DATA_DIR, 'documents.json');
 const DEMO_CACHE_FILE = path.join(DATA_DIR, 'demo_cache.json');
 const BNS_MAP_FILE = path.join(DATA_DIR, 'ipc_bns_map.json');
+const PIPELINE_VERSION = '2.1';
+
 
 let bnsMap = [];
 try {
@@ -422,7 +424,12 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
         const fileHash = hash.digest('hex');
 
         const cachedDoc = await db.findDocumentByHash(fileHash);
-        if (cachedDoc) {
+        if (
+            cachedDoc &&
+            cachedDoc.hash === fileHash &&
+            cachedDoc.status === 'completed' &&
+            cachedDoc.pipelineVersion === PIPELINE_VERSION
+        ) {
             console.log(`[Stage 0] Cache hit for ${fileHash}`);
             sendProgress(uploadId, 'completed', 100, 'Loaded from instant cache', { documentId: cachedDoc.id });
             const clientDoc = { ...cachedDoc };
@@ -436,7 +443,8 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
             hash: fileHash,
             fileName: fileName,
             uploadDate: new Date().toISOString(),
-            status: 'processing'
+            status: 'processing',
+            pipelineVersion: PIPELINE_VERSION
         };
         documents.push(newDoc);
         await db.saveDocument(newDoc);
