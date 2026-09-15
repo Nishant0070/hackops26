@@ -10,6 +10,7 @@ const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
 const { PDFParse } = require('pdf-parse');
 const { extractCitations } = require('./lib/citations');
+const { applyDeterministicFallbacks } = require('./lib/metadata_fallback');
 const { pipeline } = require('@xenova/transformers');
 const db = require('./lib/db');
 
@@ -628,6 +629,11 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
 
         // Part 2: Extract citations deterministically with tightened extractor
         const extractedCitations = extractCitations(combinedRawText, bnsMap);
+
+        // Deterministic Fallback: Apply text-grounded fallback extraction if Groq failed or omitted fields
+        const fallbackResults = applyDeterministicFallbacks(combinedRawText, structData, explainData, extractedCitations);
+        structData = fallbackResults.structData;
+        explainData = fallbackResults.explainData;
         structData.old_law_citations = extractedCitations;
 
         const finalStructuredData = {
@@ -660,6 +666,8 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
         // Stage 6: Persist
         newDoc.status = 'completed';
         newDoc.structuredData = finalStructuredData;
+        newDoc.caseNumber = finalStructuredData.case_number || null;
+        newDoc.case_number = finalStructuredData.case_number || null;
         newDoc.paragraphs = paragraphs;
         newDoc.chunks = chunks;
         await db.saveDocument(newDoc);

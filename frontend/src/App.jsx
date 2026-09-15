@@ -329,7 +329,7 @@ function App() {
                 className={`p-4 border cursor-pointer transition-all ${selectedDoc?.id === doc.id ? 'border-clawde-brass bg-clawde-ink shadow-sm' : 'border-white/10 hover:border-white/30 bg-clawde-ink/50'}`}
               >
                 <div className="flex justify-between items-start mb-1">
-                  <span className="font-bold text-sm truncate pr-2 text-clawde-parchment font-sans">{doc.structuredData?.case_number || 'No Case Number'}</span>
+                  <span className="font-bold text-sm truncate pr-2 text-clawde-parchment font-sans">{doc.caseNumber || doc.structuredData?.case_number || 'No Case Number'}</span>
                 </div>
                 <p className="text-[10px] text-clawde-brass uppercase tracking-wider font-semibold mb-1">{doc.structuredData?.doc_type || 'Legal Document'}</p>
                 <p className="text-xs text-clawde-parchment/40 truncate font-serif italic">{doc.fileName}</p>
@@ -396,7 +396,7 @@ function App() {
                   Case Number
                 </p>
                 <p className="text-[15px] font-serif text-clawde-parchment truncate">
-                  {selectedDoc.structuredData?.case_number || "N/A"}
+                  {selectedDoc.caseNumber || selectedDoc.structuredData?.case_number || "N/A"}
                 </p>
               </div>
               <div>
@@ -500,7 +500,7 @@ function App() {
                   Case Number
                 </p>
                 <p className="text-[16px] font-serif text-clawde-charcoal">
-                  {selectedDoc.structuredData?.case_number || "N/A"}
+                  {selectedDoc.caseNumber || selectedDoc.structuredData?.case_number || "N/A"}
                 </p>
               </div>
 
