@@ -229,42 +229,62 @@ class GroqRateLimiter {
         }
     }
 
+    // Helper that retries ONLY 429 and transient 5xx errors with exponential backoff (max 2 retries)
     async fetchWithBackoff(apiCallFn, estimatedTokens = 1500) {
         let attempts = 0;
-        const maxAttempts = 5;
+        const maxRetries = 2;
 
-        while (attempts < maxAttempts) {
+        while (true) {
             await this.acquire(estimatedTokens);
             try {
                 const response = await apiCallFn();
                 if (response?.headers) this.updateBudget(response.headers);
                 return response;
             } catch (error) {
-                attempts++;
-                if (error.response && error.response.headers) {
-                    this.updateBudget(error.response.headers);
+                const status = error?.status || error?.statusCode;
+
+                // Do NOT retry 400, 401, 403, 413, 422, or other non-retriable client errors
+                const isRetriable = status === 429 || (status >= 500 && status < 600);
+                if (!isRetriable) {
+                    console.error(`[RateLimiter] Non-retriable error ${status}:`, error.message);
+                    throw error;
                 }
 
-                if (error.status === 429) {
-                    let waitTime = 60000;
-                    if (error.response?.headers?.get('retry-after')) {
-                        waitTime = parseFloat(error.response.headers.get('retry-after')) * 1000;
-                    }
-                    console.log(`[RateLimiter] 429 Hit. Waiting ${waitTime}ms...`);
-                    await this.wait(Math.min(waitTime, 300000)); 
-                } else if (error.status >= 500) {
-                    const waitTime = Math.pow(2, attempts) * 1000;
-                    console.log(`[RateLimiter] 5xx Error. Backing off ${waitTime}ms...`);
-                    await this.wait(waitTime);
-                } else if (error.status === 400 || error.status === 401 || error.status === 413) {
-                    console.error(`[RateLimiter] Terminal Error ${error.status}:`, error.message);
-                    throw error;
-                } else {
+                if (attempts >= maxRetries) {
+                    console.error(`[RateLimiter] Max retries (${maxRetries}) reached for status ${status}:`, error.message);
                     throw error;
                 }
+
+                attempts++;
+
+                // Determine delay: respect Groq retry-after header when available, else exponential backoff
+                let waitTime = 1000 * Math.pow(2, attempts); // 2s, 4s
+
+                // Check headers from Groq SDK error or response
+                const rawHeaders = error?.headers || error?.response?.headers;
+                let retryAfterSec = null;
+                if (rawHeaders) {
+                    if (typeof rawHeaders.get === 'function') {
+                        retryAfterSec = rawHeaders.get('retry-after');
+                    } else if (rawHeaders['retry-after']) {
+                        retryAfterSec = rawHeaders['retry-after'];
+                    }
+                }
+
+                if (retryAfterSec) {
+                    const parsed = parseFloat(retryAfterSec);
+                    if (!isNaN(parsed) && parsed > 0) {
+                        waitTime = Math.max(parsed * 1000, 1000);
+                    }
+                }
+
+                // Cap wait time at 30 seconds for safety
+                waitTime = Math.min(waitTime, 30000);
+
+                console.log(`[RateLimiter] Retryable error ${status} (attempt ${attempts}/${maxRetries}). Waiting ${waitTime}ms before retry...`);
+                await this.wait(waitTime);
             }
         }
-        throw new Error("Max retries exceeded");
     }
 }
 const rateLimiter = new GroqRateLimiter();
@@ -548,6 +568,9 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
         sendProgress(uploadId, 'structuring', 65, 'Analyzing legal entities and structure (Groq)...');
 
         
+        // Safe bounded document text for Groq prompts to prevent 413 Request Entity Too Large
+        const boundedDocText = combinedRawText.substring(0, 12000);
+
         const structPrompt = `Analyze the following OCR text of an Indian legal document.
         Return exactly in this JSON schema:
         - "is_legal_document": boolean
@@ -559,7 +582,7 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
         - "old_law_citations": array of { "citation", "section" }
         
         TEXT:
-        ${combinedRawText.substring(0, 30000)}
+        ${boundedDocText}
         
         Respond ONLY with a valid JSON object matching the schema above. Do not include markdown formatting or explanations.`;
 
@@ -571,7 +594,7 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
         - "suggested_questions": exactly 3 suggested questions a user could ask about this document
         
         TEXT:
-        ${combinedRawText.substring(0, 30000)}
+        ${boundedDocText}
         
         Respond ONLY with a valid JSON object matching the schema above. Do not include markdown formatting or explanations.`;
 
@@ -596,10 +619,12 @@ app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => 
             }
         };
 
-        const [structResult, explainResult] = await Promise.allSettled([
-            callGroq(structPrompt, 1024, 0, "STRUCTURE (4a)"),
-            callGroq(explainPrompt, 2048, 0.3, "EXPLAIN (4b)")
-        ]);
+        // Run Groq requests sequentially for the document to avoid bursting rate limits
+        const structRes = await callGroq(structPrompt, 1024, 0, "STRUCTURE (4a)");
+        const structResult = { status: 'fulfilled', value: structRes };
+
+        const explainRes = await callGroq(explainPrompt, 2048, 0.3, "EXPLAIN (4b)");
+        const explainResult = { status: 'fulfilled', value: explainRes };
 
         let structData = {};
         let explainData = {};
@@ -819,7 +844,7 @@ Question: ${question}`
             content: `You are a helpful legal assistant. Answer the user's question based on the full document text below. Detect the language of the question and answer in the SAME language (English, Hindi, or Marathi). After your answer, on a new line write QUOTE: followed by a short verbatim phrase from the text that supports your answer. If you cannot find a clear answer in the document, reply ONLY with: NOT_IN_DOCUMENT
 
 Document:
-${(doc.structuredData?.raw_text || '').substring(0, 20000)}
+${(doc.structuredData?.raw_text || '').substring(0, 12000)}
 
 Question: ${question}`
         }], 768, 0.2);
