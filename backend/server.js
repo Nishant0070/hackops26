@@ -544,13 +544,22 @@ class GroqRateLimiter {
             estimatedTokens >
             maxAllowed
         ) {
-            console.log(
-                `[RateLimiter] Sleeping... Budget tight (${currentUsage}/${this.tokenBudget})`
-            );
+            const oldest = this.tokensUsed[0];
 
-            await this.wait(
-                5000
-            );
+            if (oldest) {
+                const waitTime = Math.max(
+                    250,
+                    60000 - (now - oldest.time) + 100
+                );
+
+                console.log(
+                    `[RateLimiter] Budget tight (${currentUsage}/${this.tokenBudget}). Waiting ${Math.ceil(waitTime / 1000)}s for token window to clear...`
+                );
+
+                await this.wait(waitTime);
+            } else {
+                await this.wait(1000);
+            }
 
             return this.acquire(
                 estimatedTokens
